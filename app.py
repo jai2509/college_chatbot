@@ -1,13 +1,8 @@
 import os
 import streamlit as st
 from langdetect import detect
-import requests
-
-# Load API key from Streamlit secrets
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
-if not GROQ_API_KEY:
-    st.error("Missing GROQ_API_KEY in Streamlit secrets.")
-    st.stop()
+from sentence_transformers import SentenceTransformer
+import faiss
 
 # Load embedded text files
 @st.cache_data
@@ -20,27 +15,30 @@ def load_text_file(path):
 
 college_text_ar = load_text_file("embedded_college.txt")
 student_guide_text_ar = load_text_file("embedded_student.txt")
-
 knowledge_base = college_text_ar + "\n" + student_guide_text_ar
 
-# Function to generate Groq chat completion
-def generate_response(prompt):
-    headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {
-        "model": "mixtral-8x7b-32768",
-        "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": 500,
-        "temperature": 0.3
-    }
-    try:
-        resp = requests.post("https://api.groq.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
-        resp.raise_for_status()
-        return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-    except requests.RequestException as e:
-        return f"Error from Groq API: {e}"
+# Prepare embeddings
+@st.cache_resource
+def prepare_index():
+    model = SentenceTransformer("all-MiniLM-L6-v2")
+    docs = knowledge_base.split("\n")
+    vectors = model.encode(docs)
+    index = faiss.IndexFlatL2(vectors.shape[1])
+    index.add(vectors)
+    return model, index, docs
+
+model, index, docs = prepare_index()
+
+# Retrieve answer from context
+def retrieve_answer(query, lang):
+    query_vec = model.encode([query])
+    D, I = index.search(query_vec, 3)
+    context = "\n".join([docs[i] for i in I[0] if i < len(docs)])
+    # Simple heuristic: just return context as answer
+    return context
 
 # Streamlit UI
-st.title("📚 College Enquiry & FAQ Chatbot")
+st.title("📚 College Enquiry & FAQ Chatbot (Offline Mode)")
 user_input = st.text_input("Ask your question in English or Arabic:")
 
 if user_input:
@@ -48,15 +46,8 @@ if user_input:
         lang = detect(user_input)
     except:
         lang = "en"
-
-    prompt = (
-        f"You are a helpful assistant for college enquiries. "
-        f"Answer the question using the context below. Respond in {'English' if lang == 'en' else 'Arabic'} only. "
-        f"Do not include sources or scores.\n\n"
-        f"Context:\n{knowledge_base}\n\nQuestion: {user_input}\nAnswer:"
-    )
-
-    with st.spinner("Generating answer..."):
-        answer = generate_response(prompt)
+    
+    with st.spinner("Searching knowledge base..."):
+        answer = retrieve_answer(user_input, lang)
 
     st.markdown(f"### Answer:\n{answer}")
