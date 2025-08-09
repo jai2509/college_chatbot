@@ -1,446 +1,62 @@
-# app.py
-# Robust, deployable Streamlit RAG chatbot (Arabic & English)
-# - Attempts semantic embeddings with sentence-transformers + faiss
-# - Falls back to sklearn TfidfVectorizer + numpy similarity if heavy libs missing
-# - Uses st.secrets for GROQ API key (Streamlit Cloud friendly)
-# - Caches heavy ops and shows immediate UI to avoid black screens
-# - Expects embedded text variables 'college_text_ar' and 'student_guide_text_ar' to be present
-#   (if not, tries to read 'embedded_college.txt' and 'embedded_student.txt')
-
 import os
-import json
-import re
-import hashlib
-import time
-from pathlib import Path
-
-import numpy as np
 import streamlit as st
+from langdetect import detect
+import requests
 
-# Prefer st.secrets for Cloud; fallback to env
-GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") if "GROQ_API_KEY" in st.secrets else os.getenv("GROQ_API_KEY")
-GROQ_API_URL = os.getenv("GROQ_API_URL", "https://api.groq.ai/v1/generate")
-GROQ_EMBED_URL = os.getenv("GROQ_EMBED_URL", None)
-
-# Quick immediate UI so the page is never blank
-st.set_page_config(page_title="College Enquiry RAG Chatbot (AR/EN)", layout="wide")
-st.title("🎓 College Enquiry — Multilingual (Arabic & English)")
-st.write("Loading... the chatbot will be ready shortly. If this is the first run it may take ~30–90s.")
-
-# safe helpers
-def clean_text(t: str) -> str:
-    return re.sub(r"\s+", " ", (t or "")).strip()
-
-def make_hash(s: str) -> str:
-    import hashlib
-    return hashlib.sha1((s or "").encode("utf-8")).hexdigest()
-
-# Try optional imports (semantic path). If they fail, we'll use fallback below.
-HAS_SENT_TRANSFORMERS = False
-HAS_FAISS = False
-HAS_SKLEARN = False
-try:
-    from sentence_transformers import SentenceTransformer
-    HAS_SENT_TRANSFORMERS = True
-except Exception:
-    HAS_SENT_TRANSFORMERS = False
-
-try:
-    import faiss
-    HAS_FAISS = True
-except Exception:
-    HAS_FAISS = False
-
-try:
-    # sklearn used for fallback TF-IDF retrieval
-    from sklearn.feature_extraction.text import TfidfVectorizer
-    from sklearn.metrics.pairwise import linear_kernel
-    HAS_SKLEARN = True
-except Exception:
-    HAS_SKLEARN = False
-
-# Language detection
-try:
-    from langdetect import detect
-except Exception:
-    def detect(text):
-        # very naive fallback: check for Arabic letters
-        if any("\u0600" <= ch <= "\u06FF" for ch in text):
-            return "ar"
-        return "en"
-
-# --------------------------
-# Load embedded texts
-# --------------------------
-# If your existing app.py contains variables 'college_text_ar' and 'student_guide_text_ar',
-# they'll be used. Otherwise the app will try to read small text files.
-COLLEGE_VAR_NAME = "college_text_ar"
-STUDENT_VAR_NAME = "student_guide_text_ar"
-
-def _get_embedded_texts():
-    # 1) Already present as variables in module (if you embedded full PDFs earlier)
-    module_globals = globals()
-    college_text = module_globals.get(COLLEGE_VAR_NAME)
-    student_text = module_globals.get(STUDENT_VAR_NAME)
-    # 2) If not present, try small fallback files shipped with the package
-    if not college_text:
-        try:
-            with open("embedded_college.txt", "r", encoding="utf-8") as f:
-                college_text = f.read()
-        except Exception:
-            college_text = ""
-    if not student_text:
-        try:
-            with open("embedded_student.txt", "r", encoding="utf-8") as f:
-                student_text = f.read()
-        except Exception:
-            student_text = ""
-    return clean_text(college_text), clean_text(student_text)
-
-college_text_ar, student_guide_text_ar = _get_embedded_texts()
-
-if not college_text_ar and not student_guide_text_ar:
-    # If nothing available, show helpful message and stop early to avoid blank UI
-    st.error(
-        "No embedded documents found. Please ensure `college_text_ar` and `student_guide_text_ar` "
-        "variables exist in this file OR place `embedded_college.txt` and `embedded_student.txt` in the app folder."
-    )
+# Load API key from Streamlit secrets
+GROQ_API_KEY = st.secrets.get("GROQ_API_KEY")
+if not GROQ_API_KEY:
+    st.error("Missing GROQ_API_KEY in Streamlit secrets.")
     st.stop()
 
-# --------------------------
-# Vector index builder & loader
-# - tries to use faiss + sentence-transformers
-# - fallback to sklearn TfidfVectorizer -> compute dense matrix (and persist)
-# --------------------------
+# Load embedded text files
+@st.cache_data
+def load_text_file(path):
+    if os.path.exists(path):
+        with open(path, "r", encoding="utf-8") as f:
+            return f.read()
+    else:
+        return ""
 
-INDEX_PATH = Path("college_index.faiss")
-META_PATH = Path("college_docs.json")
-TFIDF_NPZ = Path("tfidf_matrix.npz")
-TFIDF_VOCAB = Path("tfidf_vocab.json")
+college_text_ar = load_text_file("embedded_college.txt")
+student_guide_text_ar = load_text_file("embedded_student.txt")
 
-@st.cache_resource
-def get_embedding_backend():
-    """
-    Returns a dict describing which backend and objects are available:
-    - 'mode': 'semantic' or 'tfidf'
-    - 'embedder': SentenceTransformer instance (if semantic)
-    - 'vectorizer': TfidfVectorizer instance (if fallback)
-    - 'faiss': bool if faiss is available
-    """
-    backend = {"mode": None, "embedder": None, "vectorizer": None, "faiss": False}
-    if HAS_SENT_TRANSFORMERS:
-        try:
-            embed_model = SentenceTransformer("paraphrase-multilingual-MiniLM-L12-v2")
-            backend["mode"] = "semantic"
-            backend["embedder"] = embed_model
-            backend["faiss"] = HAS_FAISS
-            return backend
-        except Exception as e:
-            # could not load heavy model — fallback to TF-IDF
-            st.warning("SentenceTransformer failed to load; falling back to TF-IDF retrieval.")
-    if HAS_SKLEARN:
-        vec = TfidfVectorizer(ngram_range=(1,2), max_features=50000)
-        backend["mode"] = "tfidf"
-        backend["vectorizer"] = vec
-        backend["faiss"] = False
-        return backend
-    # Last-resort naive bag-of-words fallback (very simple)
-    backend["mode"] = "naive"
-    backend["vectorizer"] = None
-    backend["faiss"] = False
-    return backend
+knowledge_base = college_text_ar + "\n" + student_guide_text_ar
 
-@st.cache_resource
-def build_or_load_index():
-    """
-    Returns an index-like object with:
-    - 'search(query_embedding, top_k)' method (unified)
-    - 'metadatas' list
-    """
-    backend = get_embedding_backend()
-    docs = []
-    # Combine docs
-    if college_text_ar:
-        docs.append({"source": "college_guide.pdf", "text": college_text_ar})
-    if student_guide_text_ar:
-        docs.append({"source": "student_guide.pdf", "text": student_guide_text_ar})
-    # chunk
-    chunks = []
-    metadatas = []
-    for d in docs:
-        text = d["text"]
-        words = text.split()
-        # chunk size approx 300 words
-        max_w = 300
-        overlap = 50
-        i = 0
-        while i < len(words):
-            chunk = " ".join(words[i:i+max_w])
-            chunks.append(chunk)
-            metadatas.append({"id": make_hash(d["source"] + str(i)), "source": d["source"], "chunk": i, "text": chunk})
-            i += max_w - overlap
-    # If saved index (faiss) and backend supports faiss, try load
-    if backend["faiss"] and INDEX_PATH.exists() and META_PATH.exists():
-        try:
-            idx = faiss.read_index(str(INDEX_PATH))
-            with open(META_PATH, "r", encoding="utf-8") as f:
-                meta = json.load(f)
-            class FaissWrapper:
-                def __init__(self, idx, meta):
-                    self.idx = idx
-                    self.metadatas = meta
-                def search(self, q_emb, top_k=5):
-                    # q_emb is 2D np.array
-                    qn = q_emb / (np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-10)
-                    D, I = self.idx.search(qn.astype("float32"), top_k)
-                    res = []
-                    for scores, idxs in zip(D, I):
-                        for s, idx in zip(scores, idxs):
-                            if idx < len(self.metadatas):
-                                res.append((self.metadatas[idx], float(s)))
-                    return res
-            return FaissWrapper(idx, meta)
-        except Exception:
-            st.info("Could not load pre-saved FAISS index; rebuilding...")
-    # Semantic path
-    if backend["mode"] == "semantic" and backend["embedder"] is not None:
-        embedder = backend["embedder"]
-        try:
-            embs = embedder.encode(chunks, show_progress_bar=False, convert_to_numpy=True)
-        except TypeError:
-            # older SentenceTransformer versions don't accept convert_to_numpy
-            embs = np.array([np.array(x) for x in embedder.encode(chunks, show_progress_bar=False)])
-        # normalize
-        norms = np.linalg.norm(embs, axis=1, keepdims=True)
-        norms[norms==0] = 1e-10
-        embs_norm = embs / norms
-        if backend["faiss"]:
-            dim = embs_norm.shape[1]
-            idx = faiss.IndexFlatIP(dim)
-            idx.add(embs_norm.astype("float32"))
-            # save index and metadata
-            try:
-                faiss.write_index(idx, str(INDEX_PATH))
-                with open(META_PATH, "w", encoding="utf-8") as f:
-                    json.dump(metadatas, f, ensure_ascii=False, indent=2)
-            except Exception:
-                st.warning("Could not persist FAISS index to disk (permission or env issue).")
-            class FaissBuilt:
-                def __init__(self, idx, meta):
-                    self.idx = idx
-                    self.metadatas = meta
-                def search(self, q_emb, top_k=5):
-                    qn = q_emb / (np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-10)
-                    D, I = self.idx.search(qn.astype("float32"), top_k)
-                    res = []
-                    for scores, idxs in zip(D, I):
-                        for s, idx in zip(scores, idxs):
-                            if idx < len(self.metadatas):
-                                res.append((self.metadatas[idx], float(s)))
-                    return res
-            return FaissBuilt(idx, metadatas)
-        else:
-            # store embs in-memory for brute-force search later
-            class SemanticInMemory:
-                def __init__(self, embs_norm, meta):
-                    self.embs = embs_norm
-                    self.metadatas = meta
-                def search(self, q_emb, top_k=5):
-                    qn = q_emb / (np.linalg.norm(q_emb, axis=1, keepdims=True) + 1e-10)
-                    sims = np.dot(qn, self.embs.T)  # (1, N)
-                    idxs = np.argsort(-sims, axis=1)[:, :top_k]
-                    res = []
-                    for row_i in range(idxs.shape[0]):
-                        for j in idxs[row_i]:
-                            res.append((self.metadatas[int(j)], float(sims[row_i, j])))
-                    return res
-            return SemanticInMemory(embs_norm, metadatas)
-    # TF-IDF fallback
-    if backend["mode"] == "tfidf" and backend["vectorizer"] is not None:
-        vec = backend["vectorizer"]
-        X = vec.fit_transform(chunks)  # sparse matrix
-        # Try to persist
-        try:
-            # save matrix and vocab (sparse matrix to npz)
-            from scipy import sparse
-            sparse.save_npz(str(TFIDF_NPZ), X)
-            vocab = vec.vocabulary_
-            with open(TFIDF_VOCAB, "w", encoding="utf-8") as f:
-                json.dump(vocab, f, ensure_ascii=False)
-            with open(META_PATH, "w", encoding="utf-8") as f:
-                json.dump(metadatas, f, ensure_ascii=False, indent=2)
-        except Exception:
-            # not critical
-            pass
-        class TfidfWrapper:
-            def __init__(self, X, vectorizer, chunks, meta):
-                self.X = X
-                self.vectorizer = vectorizer
-                self.chunks = chunks
-                self.metadatas = meta
-            def search(self, q_emb_or_text, top_k=5):
-                # here q_emb_or_text is text for TF-IDF wrapper
-                q_vec = self.vectorizer.transform([q_emb_or_text])
-                # use cosine via linear_kernel
-                sims = linear_kernel(q_vec, self.X).flatten()
-                idxs = np.argsort(-sims)[:top_k]
-                res = [(self.metadatas[int(i)], float(sims[i])) for i in idxs]
-                return res
-        return TfidfWrapper(X, vec, chunks, metadatas)
-    # Naive fallback: substring matching ranking
-    class NaiveWrapper:
-        def __init__(self, chunks, meta):
-            self.chunks = chunks
-            self.metadatas = meta
-        def search(self, q_text, top_k=5):
-            scores = []
-            ql = q_text.lower()
-            for i, c in enumerate(self.chunks):
-                scores.append((i, c.lower().count(ql)))
-            scores.sort(key=lambda x: -x[1])
-            res = []
-            for i, sc in scores[:top_k]:
-                res.append((self.metadatas[i], float(sc)))
-            return res
-    return NaiveWrapper(chunks, metadatas)
-
-# Build/load index with spinner
-with st.spinner("Preparing knowledge base (this may take a bit on first run)..."):
-    try:
-        vectordb = build_or_load_index()
-    except Exception as e:
-        st.error(f"Failed to build index: {e}")
-        st.stop()
-
-# --------------------------
-# Groq LLM call wrapper (safe)
-# --------------------------
-import requests
-def groq_generate(prompt: str, max_tokens: int = 400, timeout: int = 25):
-    if not GROQ_API_KEY:
-        raise ValueError("GROQ_API_KEY not set. Put it in Streamlit Secrets or environment.")
+# Function to generate Groq response
+def generate_response(prompt):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
-    payload = {"prompt": prompt, "max_tokens": max_tokens}
+    payload = {
+        "model": "mixtral-8x7b-32768",
+        "prompt": prompt,
+        "max_tokens": 500,
+        "temperature": 0.3
+    }
     try:
-        r = requests.post(GROQ_API_URL, headers=headers, json=payload, timeout=timeout)
-        r.raise_for_status()
-        data = r.json()
-        # common return shapes
-        if isinstance(data, dict):
-            if "text" in data:
-                return data["text"]
-            if "choices" in data and isinstance(data["choices"], list):
-                return data["choices"][0].get("text", "")
-        return json.dumps(data)
-    except Exception as e:
-        raise RuntimeError(f"Groq request failed: {e}")
+        resp = requests.post("https://api.groq.com/v1/generate", headers=headers, json=payload, timeout=30)
+        resp.raise_for_status()
+        return resp.json().get("choices", [{}])[0].get("text", "").strip()
+    except requests.RequestException as e:
+        return f"Error from Groq API: {e}"
 
-# --------------------------
-# UI: chat box + answer flow
-# --------------------------
-st.markdown("---")
-st.markdown("Ask any question about the college (Arabic or English). The chatbot will use the embedded college documents to answer.")
-col1, col2 = st.columns([3, 1])
+# Streamlit UI
+st.title("📚 College Enquiry & FAQ Chatbot")
+user_input = st.text_input("Ask your question in English or Arabic:")
 
-with col1:
-    user_q = st.text_area("Your question (Arabic or English)", height=160)
-    ask = st.button("Ask")
-    if ask:
-        if not user_q or not user_q.strip():
-            st.warning("Please enter a question.")
-        else:
-            # detect language
-            try:
-                lang = detect(user_q)
-            except Exception:
-                lang = "en"
-            # prepare retrieval & response
-            try:
-                # If vectordb expects embeddings (semantic) — embed accordingly.
-                backend = get_embedding_backend()
-                if backend["mode"] == "semantic" and backend.get("embedder") is not None:
-                    # embed query and search
-                    q_emb = backend["embedder"].encode([user_q], show_progress_bar=False, convert_to_numpy=True) \
-                            if hasattr(backend["embedder"], "encode") else np.array([backend["embedder"].encode(user_q)])
-                    results = vectordb.search(q_emb, top_k=6)
-                elif backend["mode"] == "tfidf":
-                    # vectordb expects raw text
-                    results = vectordb.search(user_q, top_k=6)
-                else:
-                    # naive wrapper expects text
-                    results = vectordb.search(user_q, top_k=6)
-            except Exception as e:
-                st.error(f"Retrieval failed: {e}")
-                results = []
-
-            context_pieces = [r[0]["text"] for r in results] if results else []
-            sources = [{"source": r[0].get("source"), "chunk": r[0].get("chunk"), "score": r[1]} for r in results] if results else []
-
-            # Compose prompt depending on language
-            if str(lang).startswith("ar"):
-                prompt = (
-                    "أنت مساعد لمكتب القبول في الكلية. استخدم السياق التالي للإجابة على سؤال المستعلم بدقة وبالعربية. "
-                    "إذا لم يكن هناك معلومات كافية في السياق، أعطِ إرشادات تواصل واضحة (الهاتف/الموقع/البريد الإلكتروني).\n\n"
-                    "Context:\n" + "\n---\n".join(context_pieces) + "\n\n"
-                    "سؤال المستخدم: " + user_q + "\n\n"
-                    "أجب باختصار واستشهد بالمصدر بين قوسين مربعين مثل [student_guide.pdf]."
-                )
-            else:
-                prompt = (
-                    "You are an assistant for a college admissions office. Use the context below to answer the enquirer's question in English. "
-                    "If the context doesn't contain the answer, say you don't know and provide next steps (contact, website, phone).\n\n"
-                    "Context:\n" + "\n---\n".join(context_pieces) + "\n\n"
-                    "User question: " + user_q + "\n\n"
-                    "Answer concisely and cite sources in square brackets like [student_guide.pdf]."
-                )
-
-            # Generate or return context
-            with st.spinner("Generating answer..."):
-                answer = ""
-                if GROQ_API_KEY:
-                    try:
-                        answer = groq_generate(prompt, max_tokens=400)
-                    except Exception as e:
-                        st.error(f"LLM generation failed: {e}")
-                        # fallback to context-only response
-                        answer = "I couldn't generate a fluent answer; here are the most relevant excerpts:\n\n" + "\n\n---\n\n".join(context_pieces[:3])
-                else:
-                    # no LLM key: show context pieces as answer
-                    answer = "No LLM key configured. Here are the relevant excerpts:\n\n" + "\n\n---\n\n".join(context_pieces[:4])
-
-                # Display answer with correct directionality
-                if str(lang).startswith("ar"):
-                    st.markdown(f"<div dir='rtl' style='text-align: right; font-size:15px'>{answer}</div>", unsafe_allow_html=True)
-                else:
-                    st.write(answer)
-
-                st.markdown("**Sources (retrieved & scores)**")
-                st.json(sources)
-
-with col2:
-    st.markdown("**Index & system status**")
+if user_input:
     try:
-        backend = get_embedding_backend()
-        st.write(f"Retrieval mode: `{backend['mode']}`")
-        if backend['mode'] == 'semantic' and backend.get('embedder'):
-            st.write(f"Embedding model: {backend['embedder'].__class__.__name__}")
-        st.write(f"Indexed chunks: {len(getattr(vectordb, 'metadatas', []))}")
-    except Exception as e:
-        st.write(f"Status unavailable: {e}")
+        lang = detect(user_input)
+    except:
+        lang = "en"
 
-    if st.button("Clear saved index (rebuild on next run)"):
-        # remove saved artifacts if they exist and reload
-        try:
-            if INDEX_PATH.exists():
-                INDEX_PATH.unlink()
-            if META_PATH.exists():
-                META_PATH.unlink()
-            if TFIDF_NPZ.exists():
-                TFIDF_NPZ.unlink()
-            if TFIDF_VOCAB.exists():
-                TFIDF_VOCAB.unlink()
-            st.success("Saved index files removed. Reload page to rebuild.")
-        except Exception as e:
-            st.error(f"Could not remove saved index files: {e}")
+    prompt = (
+        f"You are a helpful assistant for college enquiries. "
+        f"Answer the question using the context below. Respond in {'English' if lang == 'en' else 'Arabic'} only. "
+        f"Do not include sources or scores.\n\n"
+        f"Context:\n{knowledge_base}\n\nQuestion: {user_input}\nAnswer:"
+    )
 
-# End of app.py
+    with st.spinner("Generating answer..."):
+        answer = generate_response(prompt)
+
+    st.markdown(f"### Answer:\n{answer}")
