@@ -23,19 +23,19 @@ student_guide_text_ar = load_text_file("embedded_student.txt")
 
 knowledge_base = college_text_ar + "\n" + student_guide_text_ar
 
-# Function to generate Groq response
+# Function to generate Groq chat completion
 def generate_response(prompt):
     headers = {"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"}
     payload = {
         "model": "mixtral-8x7b-32768",
-        "prompt": prompt,
+        "messages": [{"role": "user", "content": prompt}],
         "max_tokens": 500,
         "temperature": 0.3
     }
     try:
-        resp = requests.post("https://api.groq.com/v1/generate", headers=headers, json=payload, timeout=30)
+        resp = requests.post("https://api.groq.com/v1/chat/completions", headers=headers, json=payload, timeout=30)
         resp.raise_for_status()
-        return resp.json().get("choices", [{}])[0].get("text", "").strip()
+        return resp.json().get("choices", [{}])[0].get("message", {}).get("content", "").strip()
     except requests.RequestException as e:
         return f"Error from Groq API: {e}"
 
